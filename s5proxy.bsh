@@ -1,0 +1,666 @@
+#!/usr/local/bin/bash
+#==============================================================================
+#===  Purpose:	Keep different socks5 ssh proxies alive on FreeBSD
+#===		to the same host using different flacky Internet connections
+#===  Created:	MM 2019-11-12
+#===  Licence:	MIT - Use at your own risk
+#==============================================================================
+
+unset PATH
+set -e  #fail on first uncatched error
+set -u	#fail on first usage of undeclared var
+set -o pipefail
+set -f 	#noglob
+
+SSH_USR_HOST='xxx@274.204.133.xxx'
+SSH_HOST_OPT='-oHostKeyAlgorithms=+ssh-dss -oFingerprintHash=md5'
+IDRSA_1404='/usr/var/xxx/tokens/id_rsa-open'
+HOST_LAN_IP='10.0.1.1'
+BASE_S5PORT='309'
+
+VAR_RUN_SOCK='/var/run/socks_fib'
+VAR_RUN_OPEN='/var/run/open5socks'
+VAR_RUN_REQS='/var/run/socks5fails'
+
+#=== Load my net settings conf --------------------------------------
+. /etc/netfailover.conf
+if [[ "${LOADED_NETFAIL_CONF}" != '1' ]]; then echo 'Abort: Missing netfail conf'; exit 9; fi
+gPINGPOINT_ID=${#cPUB_PING_POINTS[@]}
+#=== Take random starting point -------------------------------------
+let "gWIMIP_ID = $RANDOM % (${#cWHATISMYIP[@]}-1) + 1"
+
+#=== Check existence ------------------------------------------------
+#TODO? if [[ ! -d ${SND_DIR} ]]; then echo "Abort: Sound dir missing (${SND_DIR}"; exit 9; fi
+
+#=== FreeBSD application paths
+AWK='/usr/bin/awk'
+CAT='/bin/cat'
+CURL='/usr/local/bin/curl  --proto-default https'
+GDATE='/usr/local/bin/gdate'
+GREP='/usr/bin/grep'
+KILL='/bin/kill'
+LS='/bin/ls'
+NC='/usr/bin/nc'
+NETSTAT='/usr/bin/netstat'
+PING='/sbin/ping'
+PS='/bin/ps'
+RM='/bin/rm'
+ROUTE='/sbin/route'
+SETFIB='/usr/sbin/setfib'
+SEQ='/usr/bin/seq'
+SLEEP='/bin/sleep'
+SORT='/usr/bin/sort'
+SSH='/usr/bin/ssh'
+SU='/usr/bin/su'
+SYSCTL='/sbin/sysctl'
+TAIL='/usr/bin/tail'
+TIMEOUT='/usr/bin/timeout'
+GTIMEOUT='/usr/local/bin/gtimeout'
+TR='/usr/bin/tr'
+MY_TTY=$(/usr/bin/tty)
+
+
+#=== Command functions ----------------------------------------------
+AwkCalc()	{ ${AWK} 'function abs(x) {return ((x<0)?-x:x)}  BEGIN {printf "%0.'$1'f", '$2'}'; }
+Next_Min_Epoch(){ ${GDATE} -d "$( ${GDATE} -d 'next minute' '+%Y-%m-%d %H:%M:00')" '+%s'; }
+TimeStamp()	{ ${GDATE} '+%Y-%m-%d %H:%M:%S'; }
+ShrtStamp()	{ ${GDATE} '+d%d %H:%M:%S'; }
+WordCnt()	{ echo $#; }
+
+#=== Always exit ok (speciallty for tmux cmd chain) -----------------
+trap 'echo ${BASH_LINENO[0]}; exit 0' INT
+
+#=== Declare needed arrays ------------------------------------------
+declare -r cEMA18_MULTIPLIER=$( AwkCalc 5 "2/(18+1)" )
+declare -a GATEWAYS=( 0.0.0.0 ${cGATEWAYS} )
+declare -a FIB_PID
+declare -A TALLY_=( )
+declare -a EVENTS
+gOPEN_GW_LIST=''
+gS5_LIST=''
+
+#=== Init Arrays ----------------------------------------------------
+for N in $( ${SEQ} 0 $( ${SYSCTL} -n net.fibs ) ); do
+	TALLY_[LAST_XC_$N]=0
+	TALLY_[LAST_LAP_$N]=0
+	TALLY_[EMA_$N]=''
+	TALLY_[FAILX_$N]=0
+	TALLY_[LAST_CHECK_EPOCH]=0
+done
+unset N
+
+
+#--------------------------------------------------------------------
+Log() {
+#-------#============================================================
+	#===  Log event in array
+	#============================================================
+	local LOG_LINE="$(ShrtStamp)  '$*'"
+	EVENTS+=( "${LOG_LINE}" )
+	echo ">>> ${LOG_LINE}" > ${MY_TTY}
+}
+
+#--------------------------------------------------------------------
+GetOpenGateways() {
+#-------#============================================================
+	#===  Collect Open gateways to internet
+	#============================================================
+	local IDFIB=0
+	local FIBGW
+
+	#=== Reset list. we are rebuilding --------------------------
+	gOPEN_GW_LIST=''
+	echo -n 'Finding Open Gateways... '
+
+	#=== Check & Set-up Fibs for available gateways =============
+	#=== Note: /boot/loader.conf -> net.fibs="N"
+	local HIGHEST_FIB=$(( $( ${SYSCTL} -n net.fibs ) -1 ))
+	#=== Cycle through all system gateway and see which work ----
+	while [[ ${IDFIB} -lt ${HIGHEST_FIB} ]]; do
+		#=== Increment fib number ---------------------------
+		IDFIB=$(( ${IDFIB}+1 ))
+		echo -n " #${IDFIB}:"
+
+		#=== Get gateway set for this fib -------------------
+		FIBGW=$( ${SETFIB} ${IDFIB} ${NETSTAT} -rn | ${AWK} '/^default/ {printf "%s", $2}')
+		#=== If no gateway for fib: add ---------------------
+		if [[ "${FIBGW:-X}" == 'X' ]]; then
+			#=== Set if gateway exists for this fib -----
+			if [[ "${GATEWAYS[${IDFIB}]:-X}" != 'X' ]]; then
+				#=== Do we have a gateway for this fib ------
+				if [[ $( ${PING} -W 1 -c3 -o ${GATEWAYS[${IDFIB}]} > /dev/null 2>&1 && echo 0 || echo $? ) -eq 0 ]]; then
+					#=== Warning: Kernel panic on concurrent sets
+					Log "Add gateway (${GATEWAYS[${IDFIB}]}) route for fib[${IDFIB}]"
+					${SETFIB} ${IDFIB} ${ROUTE} add default ${GATEWAYS[${IDFIB}]} > ${MY_TTY} 2>&1 || true
+				else
+					continue
+				fi
+			fi
+			#=== Skip the recheck, so do next pass ------
+			continue
+		fi
+		echo -n '.'
+
+		#=== Check if gateway is up; if not next ------------
+		if [[ $( ${PING} -W 1 -c3 -o ${FIBGW} > /dev/null 2>&1 && echo 0 || echo $? ) -ne 0 ]]; then continue; fi
+		echo -n 'o'
+
+		#=== Try next Ping Point in list --------------------
+		if [[ ${gPINGPOINT_ID} -eq 0 ]]; then gPINGPOINT_ID=${#cPUB_PING_POINTS[@]}; fi
+		(( gPINGPOINT_ID-- ))
+
+		#=== Check if we can ping the Internet --------------
+		if [[ $( ${SETFIB} ${IDFIB} ${PING} -W 3 -c3 -o ${cPUB_PING_POINTS[${gPINGPOINT_ID}]} > /dev/null 2>&1 && echo 0 || echo $? ) -ne 0 ]]; then
+			echo; Log "Fib[${IDFIB}] ping fail on: ${cPUB_PING_POINTS[${gPINGPOINT_ID}]} "
+			continue
+		fi
+		echo -n 'O'
+
+		#=== Add to list of open gateways -------------------
+		gOPEN_GW_LIST+="${IDFIB} "
+
+	done
+	echo
+}
+
+
+#--------------------------------------------------------------------
+Talkto_SSH_Instance() {
+#-------#============================================================
+	#===  Use master/slave setup to talk to SSH instance
+	#============================================================
+	local FID=${1:-X}
+	if [[ "${FID}" == 'X' ]]; then exit 9; fi
+	local VERB=${2:-check}
+
+	#=== Simple check: do we have a fs sock ---------------------
+	if [[ ! -S ${VAR_RUN_SOCK}${FID} ]]; then
+		Log "Missing SSH Master Socks (${VAR_RUN_SOCK}${FID})" > ${MY_TTY}
+		return 9
+	fi
+
+	case ${VERB} in
+		pid)	#=== Return PID -----------------------------
+			${SSH} -O check -S ${VAR_RUN_SOCK}${FID} ${SSH_USR_HOST} 2>&1 | ${AWK} -F '=' '{printf "%s ", $2}' | ${TR} -Cd '[:digit:]'
+			;;
+		check)	#=== return: 1=Ok and 0=fail ----------------
+			return $( ${SSH} -O check -S ${VAR_RUN_SOCK}${FID} ${SSH_USR_HOST} 2>&1 | ${GREP} -q '^Master running' )
+			;;
+	esac
+}
+
+
+#--------------------------------------------------------------------
+Get_PID_Sock5Port_Owner() {
+#-------#============================================================
+	#===  Get PID of SSH offering requested sock5 port
+	#============================================================
+	local FID=${1:-X}
+	if [[ "${FID}" == 'X' ]]; then exit 9; fi
+	#=== Use ps, lsof or netstat to get owner -------------------
+	#=== Note: Use -w or ps line is length set to window witdh --
+	${PS} -wx | ${GREP} "\-[D] ${BASE_S5PORT}${FID} " | ${AWK} '{print $1}'
+}
+
+
+#--------------------------------------------------------------------
+Setup_SSH_Connection() {
+#-------#============================================================
+	#===  Wrapper to start SSH with Socks5
+	#============================================================
+	local FID="${1:-X}"
+	if [[ "${FID}" == 'X' ]]; then exit 9; fi
+	local EXITCODE
+
+	#=== The whole purpose is to have a socks5 port, so ---------
+	#=== Kill any rogue SSH's on our socks5 port ----------------
+	Close_SSH_Connection ${FID}
+
+	#=== Open SSH + Socks5 for given fib ------------------------
+	#=== -q(quit), -C(Compress), -N(do not execute commands), ---
+	#=== -f(fork), -T(disable pseudo tty), -M(master mode), -----
+	#=== -S(sock file), -D(sock5 port)
+	local SSH_CLNT_OPT="-D ${BASE_S5PORT}${FID} -fNTM -S ${VAR_RUN_SOCK}${FID}"
+	local SSH_XTRA_OPT='-o ConnectTimeout=7 -o BatchMode=yes -o ExitOnForwardFailure=yes'
+set -xv
+	${GTIMEOUT} --preserve-status 10  ${SETFIB} ${FID} ${SSH} ${SSH_HOST_OPT} ${SSH_CLNT_OPT} -p 24 -i ${IDRSA_1404} ${SSH_XTRA_OPT} ${SSH_USR_HOST} && EXITCODE=$? || EXITCODE=$?
+	if [[ ${EXITCODE} -ne 0 ]]; then
+		Log "Error SSH setup fib${FID}: ${EXITCODE}"
+set +xv
+		return 0
+	fi
+set +xv
+
+	#=== Be extra safe store ssh pid ----------------------------
+	FIB_PID[${FID}]=$( Talkto_SSH_Instance ${FID} 'pid' )
+	#=== If fails, tear down connection again -------------------
+	#if [[ -z "${FIB_PID[${FID}]}" ]]; then
+	if [[ "${FIB_PID[${FID}]:-X}" == 'X' ]]; then
+		Log "Warning: Failed to talk to new fib${FID} SSH!"
+		Close_SSH_Connection ${FID}
+	fi
+
+}
+
+
+#--------------------------------------------------------------------
+Close_SSH_Connection() {
+#-------#============================================================
+	#===  Surefire way of exiting SSH
+	#============================================================
+	local FID="${1:-X}"
+	if [[ "${FID}" == 'X' ]]; then exit 9; fi
+	local SIG
+
+	#=== Use sock to tell to close ------------------------------
+	if [[ -S ${VAR_RUN_SOCK}${FID} ]]; then
+		${SSH} -O exit -S ${VAR_RUN_SOCK}${FID} ${SSH_USR_HOST}
+		${SLEEP} 1
+	fi
+
+	#=== There is nothing to kill if we have no PID -------------
+	#=== If we have a pid, check if closed ----------------------
+	if [[ "${FIB_PID[${FID}]:-X}" != 'X' ]]; then
+		Kill_PID ${FIB_PID[${FID}]}
+		FIB_PID[${FID}]=''
+		return 0
+	fi
+
+	#=== Code comes here when no PID, aka fresh start -----------
+	#=== Check if no rogue instance is using our port -----------
+	local PID_PORT_OWNER=$( Get_PID_Sock5Port_Owner ${FID} )
+	if [[ "${PID_PORT_OWNER:-X}" != 'X' ]]; then Kill_PID ${PID_PORT_OWNER}; fi
+
+}
+
+
+#--------------------------------------------------------------------
+Kill_PID() {
+#-------#============================================================
+	#===  Kill program with PID
+	#============================================================
+	local APP_PID=${1:-X}
+	if [[ "${APP_PID}" == 'X' ]]; then exit 9; fi
+
+	#=== Kill with HUP, QUIT, ABORT, 9KILL ----------------------
+	for SIG in 1 3 6 9; do
+		#=== use /proc to see if running --------------------
+		if [[ -d /proc/${APP_PID} ]]; then
+			echo -n "SSH (PID=${APP_PID}): "
+			${KILL} -${SIG} ${APP_PID} 2>&1 > /dev/null
+			${SLEEP} 1.5
+		else
+			#=== App/SSH not running, return ------------
+			return 0
+		fi
+	done
+}
+
+
+#--------------------------------------------------------------------
+Baseline_Ping_Localhost_Host() {
+#-------#============================================================
+	#=== Check what times are through VPN
+	#============================================================
+	local PORT; local XC
+
+	#=== Reset variable -----------------------------------------
+	TALLY_[LAST_XC_0]=0
+
+	local WHEEL='-\|/'
+	echo -n '.'
+	#=== Time whole process -------------------------------------
+	local START=$( ${GDATE} +'%s.%N')
+	for PORT in 24 25 53 1723; do
+		echo -en '\b'
+		echo -n "${WHEEL:0:1}"
+		WHEEL="${WHEEL:1}"
+		#=== Use netcat to check localhost port on host -----
+		XC=$( ${SU} -m nobody -c "${TIMEOUT} 3 ${NC} -w 1 -z ${HOST_LAN_IP} ${PORT} > /dev/null 2>&1" && echo 2 || echo 0 )
+		if [[ ${XC:-0} -eq 0 ]]; then
+			#=== Tell about failure ---------------------
+		#	Log "Connect failure port ${PORT} on fib[0]"
+			echo ">>> Connect failure port ${PORT} on fib[0]" > ${MY_TTY}
+		else
+			#=== Calc successes -------------------------
+			let "TALLY_[LAST_XC_0]+=${XC}"
+		fi
+
+	done
+	echo -en '\b'
+
+	local END=$( ${GDATE} +'%s.%N')
+	#=== Store total round trip time ----------------------------
+	TALLY_[LAST_LAP_0]=$( ${AWK} 'BEGIN {printf "%0.3f", '${END}-${START}'}' )
+	#=== Calculate weighted average -----------------------------
+	#if [[ -z "${TALLY_[EMA_0]}" ]]; then TALLY_[EMA_0]=${TALLY_[LAST_LAP_0]}; fi
+	if [[ "${TALLY_[EMA_0]:-X}" == 'X' ]]; then TALLY_[EMA_0]=${TALLY_[LAST_LAP_0]}; fi
+	TALLY_[EMA_0]=$( AwkCalc 3 "(${TALLY_[LAST_LAP_0]}-(${TALLY_[EMA_0]}))*${cEMA18_MULTIPLIER}+${TALLY_[EMA_0]}" )
+
+	#=== Feedback -----------------------------------------------
+	local ALL=''; if [[ ${TALLY_[LAST_XC_0]} -eq 8 ]]; then ALL=' All'; fi
+	echo "VPN Fib[0]:${ALL} Ok! (Last:${TALLY_[LAST_LAP_0]}s, EMA:${TALLY_[EMA_0]}s)"
+
+}
+
+
+#--------------------------------------------------------------------
+Ping_Localhost_Host_Services() {
+#-------#============================================================
+	#===  Connect to different localhost services
+	#============================================================
+	local FID="${1:-X}"
+	if [[ "${FID}" == 'X' ]]; then exit 9; fi
+
+	local PORT; local XC=0
+	local START; local END
+	local EXITCODE=-1
+
+	#=== Reset variable -----------------------------------------
+	TALLY_[LAST_XC_${FID}]=0
+
+	#=== On reported error do extra check (reach Internet) ------
+	if [[ ${TALLY_[FAILX_${FID}]} -gt 0 ]]; then
+		#=== Try next Ping Point in list --------------------
+		if [[ ${gWIMIP_ID} -eq 0 ]]; then gWIMIP_ID=${#cWHATISMYIP[@]}; fi
+		(( gWIMIP_ID-- ))
+		echo -n "Xtra proxy check fib[${FID}]: Curl my IP "
+		RESULT=$( ${SU} -m nobody -c "${CURL} --connect-timeout 3 -sx socks5://127.0.0.1:${BASE_S5PORT}${FID} ${cWHATISMYIP[${gWIMIP_ID}]}") && EXITCODE=$? || EXITCODE=$?
+		if [[ ${EXITCODE} -ne 0 || ${RESULT:-X} == 'X' ]]; then
+			#=== Log error ------------------------------
+			Log "Fail on: ${cWHATISMYIP[${gWIMIP_ID}]}"
+			#=== Close echo -----------------------------
+			echo	#=- Close echo
+			#=== Set XC to 0 to perculate up error ------
+			TALLY_[LAST_XC_${FID}]=0
+			#=== Noting more to do, reset next ----------
+			return 0
+		fi
+		#=== Close echo with the result ---------------------
+		echo "[${RESULT}]"
+		#=== Catch bad host ---------------------------------
+		if [[ ${#RESULT} -gt 20 ]]; then read -p "Bad 'What Is My IP' Host: ${cWHATISMYIP[${gWIMIP_ID}]} " tellme; fi
+	fi
+
+	local WHEEL='-\|/'
+	echo -n '.'
+	#=== Time whole process -------------------------------------
+	START=$( ${GDATE} +'%s.%N')
+	for PORT in 24 25 53 1723; do
+
+		echo -en '\b'
+		echo -n "${WHEEL:0:1}"
+		WHEEL="${WHEEL:1}"
+		#=== Use netcat to check localhost port on host -----
+		XC=$( ${SU} -m nobody -c "${TIMEOUT} 3 ${NC} -w 1 -X 5 -x 127.0.0.1:${BASE_S5PORT}${FID} -z 127.0.0.1 ${PORT} > /dev/null 2>&1" && echo 2 || echo 0 )
+
+		#=== Report port failure ----------------------------
+		if [[ ${XC:-0} -eq 0 ]]; then
+			#=== Report connect failure -----------------
+			Log "Connect fail port ${PORT} on fib[${FID}]"
+			#=== Punshment is +1 the total ports check --
+			TALLY_[FAILX_${FID}]=$(( ${TALLY_[FAILX_${FID}]}+6 ))
+
+		else
+			#=== Calc successes -------------------------
+			let "TALLY_[LAST_XC_${FID}]+=${XC}"
+			#=== With every good port subtract 1 --------
+			if [[ ${TALLY_[FAILX_${FID}]} -gt 0 ]]; then (( TALLY_[FAILX_${FID}]-- )); fi
+		fi
+
+	done
+	echo -en '\b'
+
+	#=== Note: port timeout increases EMA of lapse time, --------
+	#=== Higher EMA is punshiment for bad connection
+	END=$( ${GDATE} +'%s.%N')
+	#=== Store total round trip time ----------------------------
+	TALLY_[LAST_LAP_${FID}]=$( ${AWK} 'BEGIN {printf "%0.3f", '${END}-${START}'}' )
+	#=== Calculate weighted average -----------------------------
+	#if [[ -z "${TALLY_[EMA_${FID}]}" ]]; then TALLY_[EMA_${FID}]=${TALLY_[LAST_LAP_${FID}]}; fi
+	if [[ "${TALLY_[EMA_${FID}]:-X}" == 'X' ]]; then TALLY_[EMA_${FID}]=${TALLY_[LAST_LAP_${FID}]}; fi
+	TALLY_[EMA_${FID}]=$( AwkCalc 3 "(${TALLY_[LAST_LAP_${FID}]}-(${TALLY_[EMA_${FID}]}))*${cEMA18_MULTIPLIER}+${TALLY_[EMA_${FID}]}" )
+
+}
+
+
+#--------------------------------------------------------------------
+Ensure_SSH_perGW() {
+#-------#============================================================
+	#===  Ensure SSH connectoin for all open gateways
+	#============================================================
+	local CHECK_LIST="${1:-${gOPEN_GW_LIST}}"
+	local RECURSIVE_CNT=${2:-0}
+
+	local FIBID
+	local ALL
+
+	#=== Avoid endless loop -------------------------------------
+	if [[ ${RECURSIVE_CNT} -gt 3 ]]; then return 0
+	#=== Feedback on checking (new connection) ------------------
+	elif [[ ${RECURSIVE_CNT} -gt 0 ]]; then
+		echo "Checking New Connection fib[${CHECK_LIST}]... (try# ${RECURSIVE_CNT})"
+		${SLEEP} $(( ${RECURSIVE_CNT}*${RECURSIVE_CNT} ))
+	fi
+
+	for FIBID in ${CHECK_LIST}; do
+		#=== 1st level check: talk to master through sock ---
+		#=== Note this is only a local check ----------------
+		#if [[ -S ${VAR_RUN_SOCK}${FIBID} ]] && [[ $( Talkto_SSH_Instance ${FIBID} 'check' ) -eq 1 ]]; then
+		if $( Talkto_SSH_Instance ${FIBID} 'check' ); then
+
+			#=== Also check if pid on file --------------
+			if [[ "${FIB_PID[${FIBID}]:-X}" == 'X' ]]; then
+				FIB_PID[${FIBID}]=$( Talkto_SSH_Instance ${FIBID} 'pid' )
+			fi
+
+			#=== 3rd level check, check port on remote host lan ----
+			Ping_Localhost_Host_Services ${FIBID}
+
+			#=== Proces result 3rd check ----------------
+			ALL=''; if [[ ${TALLY_[LAST_XC_${FIBID}]} -eq 8 ]]; then ALL=' All'; fi
+			if [[ ${TALLY_[LAST_XC_${FIBID}]} -ge 6 ]]; then
+				#=== All is well. Completed ---------
+				#=== Skip below, next ---------------
+				echo "SSH Fib[${FIBID}]:${ALL} Ok! (Last:${TALLY_[LAST_LAP_${FIBID}]}s, EMA:${TALLY_[EMA_${FIBID}]}s, FAILX:${TALLY_[FAILX_${FIBID}]})"
+				TALLY_[LAST_CHECK_EPOCH_${FIBID}]=$( ${GDATE} '+%s' )
+				continue
+			fi
+		fi
+
+		#=== If we reach here, setup connection =============
+		if [[ -S ${VAR_RUN_SOCK}${FIBID} ]]; then
+			#=== Bad connection, reset ------------------
+			Log "Resetting fib${FIBID} SSH Connection"
+			Close_SSH_Connection ${FIBID}
+		fi
+		#=== Do a fresh setup -------------------------------
+		echo; Log "Building fib${FIBID} SSH Connection"
+		Setup_SSH_Connection ${FIBID}
+
+		#=== Check new connection ---------------------------
+		RECURSIVE_CNT=$(( ${RECURSIVE_CNT}+1 ))
+		Ensure_SSH_perGW ${FIBID} ${RECURSIVE_CNT}
+		#=== Reset cnt for next fib -------------------------
+		RECURSIVE_CNT=0
+
+	done
+
+}
+
+
+#--------------------------------------------------------------------
+ProcessResults() {
+#-------#============================================================
+	#===  Write the best and fastest fibs for clients
+	#============================================================
+	local FID
+	local SORT_LIST=''
+
+	#=== Only process fibs that are know to be up ---------------
+	for FID in ${gOPEN_GW_LIST}; do
+		#=== Only consider fib with no errors ---------------
+		if [[ ${TALLY_[FAILX_${FID}]} -eq 0 ]]; then
+			SORT_LIST+="${TALLY_[EMA_${FID}]} ${FID}"$'\n'
+		fi
+	done
+
+	#=== Sort collected list into file for clients --------------
+	gS5_LIST=$( echo "${SORT_LIST}" | ${SORT} -n | ${AWK} 'NF==2 {printf "'${BASE_S5PORT}'%i ", $2}' )
+	echo ${gS5_LIST}> ${VAR_RUN_OPEN}
+
+}
+
+#--------------------------------------------------------------------
+ShowEvents() {
+#-------#============================================================
+	#===  Show Event
+	#============================================================
+	local IDX; local IDX_LIST; local LEN_LIST=15
+
+	#=== Prune & show event log ---------------------------------
+	IDX_LIST="${!EVENTS[@]}"
+	for IDX in ${IDX_LIST}; do
+		#=== Remove old values ------------------------------
+		if [[ $( WordCnt ${IDX_LIST} ) -gt ${LEN_LIST}  && ${IDX} -lt $(( ${IDX_LIST##* } - ${LEN_LIST} )) ]]; then
+			unset EVENTS[$IDX]
+		else
+			echo "${EVENTS[$IDX]}"
+		fi
+	done
+
+	#=== Spot gateway drop --------------------------------------
+	#for FID in {!{
+	#TALLY_[LAST_CHECK_EPOCH]=$( ${GDATE} '+%s' )
+	#	if [[ $(( $(${GDATE} '+%s') - ${TALLY_[LAST_CHECK_EPOCH_${FID}]} )) -gt 110 ]]; then
+			#Log "Drop fib3 GW 192.168.1.3"
+	#	fi
+	#done
+}
+
+
+#--------------------------------------------------------------------
+Monitor() {
+#-------#============================================================
+	#===  Inifinite loop to monitor SSH connections
+	#============================================================
+	local LISTEN_SEC
+	local ONEREQ
+
+	#=== Clean-up stale request files ---------------------------
+	if [[ -f ${VAR_RUN_REQS} ]]; then ${RM} ${VAR_RUN_REQS}; fi
+	#=== Log start ----------------------------------------------
+	Log "Start [$$]"
+
+	while :
+	do
+		#=== Some feedback ----------------------------------
+		printf "\n#============ %s ---------\n" "$(TimeStamp)"
+
+		#=== Show events ------------------------------------
+		ShowEvents
+
+		#=== Refresh what are open gateways -----------------
+		GetOpenGateways
+#read -p pause next
+		#=== Get VPN pings as baseline ----------------------
+		Baseline_Ping_Localhost_Host
+
+		#=== Monitor SSH Connections ------------------------
+		Ensure_SSH_perGW
+
+		#=== Process Collected data -------------------------
+		ProcessResults
+
+		#=== Listen to second 45 ----------------------------
+		LISTEN_SEC=$(( $(Next_Min_Epoch) - $(${GDATE} '+%s') - 15 ))
+		if [[ ${LISTEN_SEC} -le 0 ]]; then let 'LISTEN_SEC+=60'; fi
+		#=== Or quicker upon a client request ---------------
+		while read ONEREQ; do
+
+			#=== Store event ----------------------------
+			Log "Client Notice [${ONEREQ}]"
+
+			#=== Sanity check ---------------------------
+			if [[ ${ONEREQ} =~ ^${BASE_S5PORT}[0-9]$ ]]; then
+
+				#=== Trust, remove 1st, than check --
+				#S5LIST=$( < ${VAR_RUN_OPEN} )
+				echo "${gS5_LIST/${ONEREQ}/}" > ${VAR_RUN_OPEN}
+
+				#=== Lets check what is going on ----
+				break
+			fi
+
+		done < <( ${TIMEOUT} ${LISTEN_SEC} ${TAIL} -F ${VAR_RUN_REQS} )
+		if [[ -f ${VAR_RUN_REQS} ]]; then ${RM} ${VAR_RUN_REQS}; fi
+
+	done
+}
+
+
+#--------------------------------------------------------------------
+Start_All_Connections() {
+#-------#============================================================
+	#===  Open ALL open sock5 SSH connections
+	#============================================================
+
+	#=== Get active gateways ------------------------------------
+	GetOpenGateways
+
+	#=== run twice in case of added routing ---------------------
+	if [[ "${gOPEN_GW_LIST:-X}" == 'X' ]]; then ${SLEEP} 1; GetOpenGateways; fi
+
+	#=== Ensure all connection are up for active gateways -------
+	Ensure_SSH_perGW
+
+	#=== Set the first proxy list for clients -------------------
+	ProcessResults
+
+}
+
+#--------------------------------------------------------------------
+Close_All_Connections() {
+#-------#============================================================
+	#===  Close ALL open sock5 SSH connections
+	#============================================================
+
+	#=== Use /var/run to see what is running and close ----------
+	local RUN_LIST=$( ${LS} ${VAR_RUN_SOCK}* 2> /dev/null | { while read x; do echo -n "${x:(-1)} "; done; } )
+	for FIBID in ${RUN_LIST}; do
+		echo "Closing SSH on fib[${FIBID}]..."
+		Close_SSH_Connection ${FIBID}
+	done
+	#=== Allow things to settle down ----------------------------
+	${SLEEP} 1
+
+	#=== Use ps to check if all is closed -----------------------
+	#=== Note: Use -w or ps line is length set to window witdh --
+	for PID in $( ${PS} -wx | ${GREP} "\-[D] ${BASE_S5PORT}. " | ${AWK} '{print $1}' ); do
+		Kill_PID ${PID}
+	done
+
+	#=== Ensure sock files are removed --------------------------
+	for FILE in $( ${LS} ${VAR_RUN_SOCK}* 2> /dev/null ); do
+		${RM} ${FILE}
+	done
+
+}
+
+
+
+#====================================================================
+#===  Main
+#--------------------------------------------------------------------
+
+#=== Default: monitor or supplied as argument -----------------------
+case "${1:-M}" in
+	start)	Start_All_Connections;;
+	close)	Close_All_Connections;;
+	*)	Monitor;;
+esac
+
+
+
+exit 0
+#===[EOF]===
